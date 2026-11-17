@@ -1,8 +1,8 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
-export type PrinterBrand = 'Anycubic' | 'Creality';
-export type PrinterStatus = 'PRINTING' | 'IDLE' | 'PAUSED' | 'MAINTENANCE' | 'OFFLINE';
+export type PrinterBrand = 'Anycubic' | 'Creality' | 'Altro';
+export type PrinterStatus = 'PRINTING' | 'IDLE' | 'PAUSED' | 'OFFLINE';
 
 export interface MaintenanceComponent {
   id: string;
@@ -19,27 +19,27 @@ export interface PrinterUnit {
   model: string;
   ipAddress: string;
   port: number;
-  apiType: 'Moonraker' | 'AnycubicCloud' | 'OctoPrint';
+  apiType: 'Moonraker' | 'OctoPrint' | 'Manuale';
+  smartPlugIp?: string; // Opzionale: IP presa Shelly / Tasmota per lettura Watt reali
   status: PrinterStatus;
   loadedSpoolId: string | null;
-  // Job attivo
-  currentJobName: string | null;
-  progress: number; // 0 - 100
-  flowRateMm3s: number; // mm3/s per calcolo consumo grammi in tempo reale
+  currentJobName: string;
+  progress: number;
+  flowRateMm3s: number;
   elapsedSeconds: number;
   estimatedTotalSeconds: number;
-  // Telemetria Termica ed Elettrica
   nozzleTemp: number;
   nozzleTarget: number;
   bedTemp: number;
   bedTarget: number;
   currentWatts: number;
+  printingWattsConfig: number; // Watt medi reali in stampa (configurabili)
+  idleWattsConfig: number;     // Watt in standby (configurabili)
   ratedMaxWatts: number;
   totalKwhConsumed: number;
-  // Telecamera
   streamUrl: string;
-  // Manutenzione
   totalPrintHours: number;
+  isLiveConnected: boolean;    // True se risponde al ping di rete
   components: MaintenanceComponent[];
 }
 
@@ -51,8 +51,8 @@ export interface Spool {
   colorName: string;
   colorHex: string;
   initialWeightG: number;
-  remainingWeightG: number; // Scende in tempo reale (es. 742.84 g)
-  densityGcm3: number; // PLA: 1.24, PETG: 1.27, ABS: 1.04
+  remainingWeightG: number;
+  densityGcm3: number;
   costPerKg: number;
   reorderThresholdG: number;
   nfcUid: string;
@@ -77,230 +77,289 @@ interface ErpState {
   spools: Spool[];
   orders: PurchaseOrder[];
 
-  // Azioni Real-Time (1 secondo)
+  // Motore Real-Time
   tickRealTimeTelemetry: () => void;
+  pollRealHardware: () => Promise<{ onlineCount: number; details: string[] }>;
 
-  // Azioni Stampanti
+  // CRUD Stampanti
+  addPrinter: (printer: Omit<PrinterUnit, 'id' | 'totalPrintHours' | 'totalKwhConsumed' | 'components' | 'currentWatts' | 'isLiveConnected' | 'elapsedSeconds'>) => void;
+  updatePrinter: (id: string, data: Partial<PrinterUnit>) => void;
+  deletePrinter: (id: string) => void;
   togglePrinterStatus: (printerId: string) => void;
-  assignSpoolToPrinter: (printerId: string, spoolId: string) => void;
-  updatePrinterNetwork: (printerId: string, ip: string, port: number, streamUrl: string) => void;
-  addDiscoveredPrinter: (printer: Omit<PrinterUnit, 'id' | 'totalPrintHours' | 'totalKwhConsumed' | 'components'>) => void;
+  assignSpoolToPrinter: (printerId: string, spoolId: string | null) => void;
 
-  // Azioni Filamenti
+  // CRUD Filamenti
   addSpool: (spool: Omit<Spool, 'id'>) => void;
+  updateSpoolWeight: (spoolId: string, newWeightG: number) => void;
+  deleteSpool: (spoolId: string) => void;
   refillSpool: (spoolId: string) => void;
 
-  // Azioni Manutenzione & Ordini
+  // Manutenzione & Ordini
   resetComponentWear: (printerId: string, componentId: string) => void;
+  addManualOrder: (description: string, category: 'FILAMENT' | 'SPARE_PART', cost: number, priority: 'LOW' | 'HIGH' | 'CRITICAL') => void;
   markOrderAsOrdered: (orderId: string) => void;
   deleteOrder: (orderId: string) => void;
   setElectricityRate: (rate: number) => void;
 }
 
-const createDefaultComponents = (h1 = 120, h2 = 310, h3 = 85): MaintenanceComponent[] => [
-  { id: 'nozzle', name: 'Ugello Hardened 0.4mm', currentHours: h1, maxHours: 300, lastServiced: '2025-01-15' },
-  { id: 'belts', name: 'Cinghie Gates GT2 X/Y', currentHours: h2, maxHours: 600, lastServiced: '2024-11-20' },
-  { id: 'z_lube', name: 'Lubrificazione Viti Trapezoidali Z', currentHours: h3, maxHours: 150, lastServiced: '2025-02-01' },
-  { id: 'ptfe', name: 'Tubo PTFE / Bowden Estrusore', currentHours: h1 + 40, maxHours: 400, lastServiced: '2025-01-10' },
+export const createDefaultComponents = (h1 = 0, h2 = 0, h3 = 0): MaintenanceComponent[] => [
+  { id: 'nozzle', name: 'Ugello 0.4mm', currentHours: h1, maxHours: 300, lastServiced: new Date().toISOString().split('T')[0] },
+  { id: 'belts', name: 'Cinghie GT2 X/Y', currentHours: h2, maxHours: 600, lastServiced: new Date().toISOString().split('T')[0] },
+  { id: 'z_lube', name: 'Lubrificazione Viti Z', currentHours: h3, maxHours: 150, lastServiced: new Date().toISOString().split('T')[0] },
+  { id: 'ptfe', name: 'Tubo PTFE Estrusore', currentHours: h1, maxHours: 400, lastServiced: new Date().toISOString().split('T')[0] },
 ];
 
 export const useErpStore = create<ErpState>()(
   persist(
     (set, get) => ({
-      electricityCostPerKwh: 0.28, // Tariffa media aziendale €/kWh
-      sessionKwh: 14.82,
-      sessionCostEur: 4.15,
+      electricityCostPerKwh: 0.28,
+      sessionKwh: 0,
+      sessionCostEur: 0,
 
       printers: [
         {
           id: 'any-01',
-          code: 'ANC-KOBRA-01',
+          code: 'ANYCUBIC-01',
           brand: 'Anycubic',
-          model: 'Kobra 3 Combo',
+          model: 'Anycubic #1 (Configura IP)',
           ipAddress: '192.168.1.101',
           port: 7125,
-          apiType: 'AnycubicCloud',
+          apiType: 'Moonraker',
+          smartPlugIp: '',
           status: 'PRINTING',
           loadedSpoolId: 'sp-1',
-          currentJobName: 'staffa_supporto_industriale_v4.gcode',
-          progress: 64.2,
-          flowRateMm3s: 14.5, // ~0.018 grammi al secondo
-          elapsedSeconds: 8420,
-          estimatedTotalSeconds: 13100,
-          nozzleTemp: 215,
-          nozzleTarget: 215,
+          currentJobName: 'In stampa attiva',
+          progress: 35,
+          flowRateMm3s: 12.0,
+          elapsedSeconds: 3600,
+          estimatedTotalSeconds: 10800,
+          nozzleTemp: 210,
+          nozzleTarget: 210,
           bedTemp: 60,
           bedTarget: 60,
           currentWatts: 185,
+          printingWattsConfig: 185,
+          idleWattsConfig: 12,
           ratedMaxWatts: 400,
-          totalKwhConsumed: 42.6,
+          totalKwhConsumed: 1.45,
           streamUrl: 'http://192.168.1.101:8080/?action=stream',
-          totalPrintHours: 412.5,
-          components: createDefaultComponents(265, 412, 138),
+          totalPrintHours: 120.5,
+          isLiveConnected: false,
+          components: createDefaultComponents(120, 120, 45),
         },
         {
           id: 'any-02',
-          code: 'ANC-KOBRA-02',
+          code: 'ANYCUBIC-02',
           brand: 'Anycubic',
-          model: 'Kobra 2 Pro',
+          model: 'Anycubic #2 (Configura IP)',
           ipAddress: '192.168.1.102',
           port: 7125,
           apiType: 'Moonraker',
-          status: 'PRINTING',
-          loadedSpoolId: 'sp-2',
-          currentJobName: 'carter_protezione_motore_x10.gcode',
-          progress: 28.7,
-          flowRateMm3s: 18.2, // Alta velocità
-          elapsedSeconds: 4100,
-          estimatedTotalSeconds: 14200,
-          nozzleTemp: 240,
-          nozzleTarget: 240,
-          bedTemp: 80,
-          bedTarget: 80,
-          currentWatts: 235,
-          ratedMaxWatts: 400,
-          totalKwhConsumed: 38.1,
-          streamUrl: 'http://192.168.1.102:8080/?action=stream',
-          totalPrintHours: 289.0,
-          components: createDefaultComponents(140, 289, 148),
-        },
-        {
-          id: 'any-03',
-          code: 'ANC-KOBRA-03',
-          brand: 'Anycubic',
-          model: 'Kobra 2 Max',
-          ipAddress: '192.168.1.103',
-          port: 7125,
-          apiType: 'AnycubicCloud',
+          smartPlugIp: '',
           status: 'IDLE',
-          loadedSpoolId: 'sp-3',
-          currentJobName: 'In attesa di produzione',
+          loadedSpoolId: 'sp-2',
+          currentJobName: 'Pronta',
           progress: 0,
           flowRateMm3s: 0,
           elapsedSeconds: 0,
-          estimatedTotalSeconds: 0,
+          estimatedTotalSeconds: 7200,
           nozzleTemp: 24,
+          nozzleTarget: 0,
+          bedTemp: 24,
+          bedTarget: 0,
+          currentWatts: 12,
+          printingWattsConfig: 190,
+          idleWattsConfig: 12,
+          ratedMaxWatts: 400,
+          totalKwhConsumed: 0.85,
+          streamUrl: 'http://192.168.1.102:8080/?action=stream',
+          totalPrintHours: 85.0,
+          isLiveConnected: false,
+          components: createDefaultComponents(85, 85, 85),
+        },
+        {
+          id: 'any-03',
+          code: 'ANYCUBIC-03',
+          brand: 'Anycubic',
+          model: 'Anycubic #3 (Configura IP)',
+          ipAddress: '192.168.1.103',
+          port: 7125,
+          apiType: 'Moonraker',
+          smartPlugIp: '',
+          status: 'IDLE',
+          loadedSpoolId: null,
+          currentJobName: 'Pronta',
+          progress: 0,
+          flowRateMm3s: 0,
+          elapsedSeconds: 0,
+          estimatedTotalSeconds: 7200,
+          nozzleTemp: 23,
           nozzleTarget: 0,
           bedTemp: 23,
           bedTarget: 0,
-          currentWatts: 12, // Consumo standby scheda madre
-          ratedMaxWatts: 500,
-          totalKwhConsumed: 61.4,
+          currentWatts: 12,
+          printingWattsConfig: 210,
+          idleWattsConfig: 12,
+          ratedMaxWatts: 450,
+          totalKwhConsumed: 2.1,
           streamUrl: 'http://192.168.1.103:8080/?action=stream',
-          totalPrintHours: 530.2,
-          components: createDefaultComponents(295, 530, 60),
+          totalPrintHours: 210.0,
+          isLiveConnected: false,
+          components: createDefaultComponents(210, 210, 110),
         },
         {
           id: 'cre-01',
-          code: 'CRE-K1C-01',
+          code: 'CREALITY-01',
           brand: 'Creality',
-          model: 'K1 Max / Ender-3 V3',
+          model: 'Creality #1 (Configura IP)',
           ipAddress: '192.168.1.104',
-          port: 4408,
+          port: 7125,
           apiType: 'Moonraker',
+          smartPlugIp: '',
           status: 'PRINTING',
-          loadedSpoolId: 'sp-4',
-          currentJobName: 'alloggiamento_sensore_ottico_ASA.gcode',
-          progress: 81.4,
-          flowRateMm3s: 16.0,
-          elapsedSeconds: 11200,
-          estimatedTotalSeconds: 13750,
-          nozzleTemp: 260,
-          nozzleTarget: 260,
-          bedTemp: 100,
-          bedTarget: 100,
-          currentWatts: 310, // Camera calda + piatto a 100°C
-          ratedMaxWatts: 600,
-          totalKwhConsumed: 54.9,
+          loadedSpoolId: 'sp-2',
+          currentJobName: 'Produzione lotto Creality',
+          progress: 60,
+          flowRateMm3s: 15.0,
+          elapsedSeconds: 5400,
+          estimatedTotalSeconds: 9000,
+          nozzleTemp: 220,
+          nozzleTarget: 220,
+          bedTemp: 65,
+          bedTarget: 65,
+          currentWatts: 240,
+          printingWattsConfig: 240,
+          idleWattsConfig: 15,
+          ratedMaxWatts: 500,
+          totalKwhConsumed: 3.2,
           streamUrl: 'http://192.168.1.104:8080/?action=stream',
-          totalPrintHours: 365.8,
-          components: createDefaultComponents(180, 365, 110),
+          totalPrintHours: 160.0,
+          isLiveConnected: false,
+          components: createDefaultComponents(160, 160, 60),
         },
       ],
 
       spools: [
         {
           id: 'sp-1',
-          sku: 'FIL-PLA-BLK-01',
-          brand: 'Anycubic High-Speed',
+          sku: 'FIL-PLA-01',
+          brand: 'Anycubic',
           material: 'PLA',
-          colorName: 'Nero Opaco Industriale',
-          colorHex: '#1e293b',
+          colorName: 'Nero',
+          colorHex: '#18181b',
           initialWeightG: 1000,
-          remainingWeightG: 642.5,
+          remainingWeightG: 780.0,
           densityGcm3: 1.24,
-          costPerKg: 18.5,
-          reorderThresholdG: 250,
-          nfcUid: '04:A2:88:1B:99:20',
+          costPerKg: 18.0,
+          reorderThresholdG: 200,
+          nfcUid: 'TAG-001',
         },
         {
           id: 'sp-2',
-          sku: 'FIL-PETG-GRY-02',
-          brand: 'eSUN PRO',
+          sku: 'FIL-PETG-02',
+          brand: 'Creality Hyper',
           material: 'PETG',
-          colorName: 'Grigio Meccanico',
+          colorName: 'Grigio',
           colorHex: '#64748b',
           initialWeightG: 1000,
-          remainingWeightG: 214.8, // Sotto soglia -> Innesca ordine
+          remainingWeightG: 420.0,
           densityGcm3: 1.27,
           costPerKg: 21.0,
-          reorderThresholdG: 250,
-          nfcUid: '04:B7:12:4C:31:88',
-        },
-        {
-          id: 'sp-3',
-          sku: 'FIL-PLA-WHT-03',
-          brand: 'Creality Hyper',
-          material: 'PLA',
-          colorName: 'Bianco Ottico',
-          colorHex: '#f8fafc',
-          initialWeightG: 1000,
-          remainingWeightG: 890.0,
-          densityGcm3: 1.24,
-          costPerKg: 19.9,
-          reorderThresholdG: 250,
-          nfcUid: '04:C1:44:9E:10:02',
-        },
-        {
-          id: 'sp-4',
-          sku: 'FIL-ASA-ORG-04',
-          brand: 'Polymaker Polylite',
-          material: 'ASA',
-          colorName: 'Arancio Sicurezza',
-          colorHex: '#f97316',
-          initialWeightG: 1000,
-          remainingWeightG: 418.2,
-          densityGcm3: 1.07,
-          costPerKg: 29.5,
-          reorderThresholdG: 250,
-          nfcUid: '04:D9:55:2A:77:19',
+          reorderThresholdG: 200,
+          nfcUid: 'TAG-002',
         },
       ],
 
-      orders: [
-        {
-          id: 'ord-init-1',
-          createdAt: 'Oggi, 08:30',
-          itemCode: 'FIL-PETG-GRY-02',
-          description: 'Bobina eSUN PRO PETG Grigio Meccanico (Sotto soglia 250g)',
-          category: 'FILAMENT',
-          priority: 'HIGH',
-          estimatedCost: 21.0,
-          status: 'PENDING',
-        },
-        {
-          id: 'ord-init-2',
-          createdAt: 'Oggi, 09:15',
-          itemCode: 'MNT-ANC-03-NOZZLE',
-          description: 'Ugello Hardened 0.4mm per ANC-KOBRA-03 (295/300h usura)',
-          category: 'SPARE_PART',
-          priority: 'CRITICAL',
-          estimatedCost: 14.5,
-          status: 'PENDING',
-        },
-      ],
+      orders: [],
 
-      // MOTORE FISICO A 1 SECONDO (Consumo Filamento + Corrente + Usura)
+      // POLLING HARDWARE REALE (Moonraker API + Shelly Smart Plug)
+      pollRealHardware: async () => {
+        const state = get();
+        let onlineCount = 0;
+        const details: string[] = [];
+
+        const updatedPrinters = await Promise.all(
+          state.printers.map(async (printer) => {
+            if (printer.apiType === 'Manuale') {
+              details.push(`${printer.code}: Modalità Manuale attiva (${printer.status})`);
+              return printer;
+            }
+
+            let updatedPrinter = { ...printer };
+
+            // 1. Tentativo interrogazione API Moonraker / Klipper
+            try {
+              const controller = new AbortController();
+              const timeout = setTimeout(() => controller.abort(), 1800);
+              const url = `http://${printer.ipAddress}:${printer.port}/printer/objects/query?heater_bed&extruder&print_stats&virtual_sdcard`;
+              const res = await fetch(url, { signal: controller.signal });
+              clearTimeout(timeout);
+
+              if (res.ok) {
+                const json = await res.json();
+                const statusData = json?.result?.status;
+                if (statusData) {
+                  onlineCount++;
+                  const rawState = statusData.print_stats?.state; // printing, paused, standby, complete
+                  const mappedStatus: PrinterStatus =
+                    rawState === 'printing'
+                      ? 'PRINTING'
+                      : rawState === 'paused'
+                      ? 'PAUSED'
+                      : 'IDLE';
+
+                  updatedPrinter = {
+                    ...updatedPrinter,
+                    isLiveConnected: true,
+                    status: mappedStatus,
+                    nozzleTemp: Math.round(statusData.extruder?.temperature || updatedPrinter.nozzleTemp),
+                    nozzleTarget: Math.round(statusData.extruder?.target || 0),
+                    bedTemp: Math.round(statusData.heater_bed?.temperature || updatedPrinter.bedTemp),
+                    bedTarget: Math.round(statusData.heater_bed?.target || 0),
+                    currentJobName: statusData.print_stats?.filename || 'Nessun file attivo',
+                    progress: Math.round((statusData.virtual_sdcard?.progress || 0) * 100),
+                  };
+                  details.push(`${printer.code} (${printer.ipAddress}:${printer.port}): CONNESSA LIVE [${mappedStatus}]`);
+                }
+              } else {
+                updatedPrinter.isLiveConnected = false;
+                details.push(`${printer.code} (${printer.ipAddress}): Nessuna risposta HTTP Moonraker (Uso stima energetica/filamento)`);
+              }
+            } catch {
+              updatedPrinter.isLiveConnected = false;
+              details.push(`${printer.code} (${printer.ipAddress}): Non raggiungibile da questo browser (Uso calcolo real-time interno)`);
+            }
+
+            // 2. Tentativo lettura Presa Smart Shelly (Gen1 /status o Gen2 /rpc/Switch.GetStatus?id=0)
+            if (printer.smartPlugIp && printer.smartPlugIp.trim() !== '') {
+              try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 1500);
+                const resPlug = await fetch(`http://${printer.smartPlugIp}/rpc/Switch.GetStatus?id=0`, {
+                  signal: controller.signal,
+                });
+                clearTimeout(timeout);
+                if (resPlug.ok) {
+                  const plugData = await resPlug.json();
+                  if (typeof plugData.apower === 'number') {
+                    updatedPrinter.currentWatts = Math.round(plugData.apower);
+                    details.push(`Presa Smart ${printer.smartPlugIp}: Letti ${updatedPrinter.currentWatts} W reali`);
+                  }
+                }
+              } catch {
+                // Mantiene il calcolo Watt basato sullo stato
+              }
+            }
+
+            return updatedPrinter;
+          })
+        );
+
+        set({ printers: updatedPrinters });
+        return { onlineCount, details };
+      },
+
+      // MOTORE A 1 SECONDO: Scorrimento Grammi + Calcolo Corrente kWh + Manutenzione
       tickRealTimeTelemetry: () =>
         set((state) => {
           let totalWattsThisSecond = 0;
@@ -308,116 +367,135 @@ export const useErpStore = create<ErpState>()(
           const updatedOrders = [...state.orders];
 
           const updatedPrinters = state.printers.map((printer) => {
-            if (printer.status !== 'PRINTING') {
-              const idleWatts = printer.status === 'OFFLINE' ? 0 : 12;
-              totalWattsThisSecond += idleWatts;
-              return { ...printer, currentWatts: idleWatts };
+            if (printer.status === 'OFFLINE') {
+              return { ...printer, currentWatts: 0 };
             }
 
-            // 1. Oscilla realisticamente i Watt del PID riscaldamento (+/- 6W)
-            const pidVariation = Math.sin(Date.now() / 1000) * 6;
-            const basePrintWatts =
-              printer.bedTarget >= 90 ? 305 : printer.bedTarget >= 75 ? 230 : 180;
-            const liveWatts = Math.round(basePrintWatts + pidVariation);
-            totalWattsThisSecond += liveWatts;
+            if (printer.status !== 'PRINTING') {
+              const idleW = printer.idleWattsConfig || 12;
+              totalWattsThisSecond += idleW;
+              const idleKwh = idleW / 1000 / 3600;
+              return {
+                ...printer,
+                currentWatts: idleW,
+                totalKwhConsumed: Number((printer.totalKwhConsumed + idleKwh).toFixed(5)),
+              };
+            }
 
+            // Se è in PRINTING: calcola oscillazione realistica PID attorno ai Watt configurati per quella stampante
+            const pidDelta = Math.round(Math.sin(Date.now() / 1200) * 5);
+            const liveWatts = Math.max(20, (printer.printingWattsConfig || 190) + pidDelta);
+            totalWattsThisSecond += liveWatts;
             const kwhAdded = liveWatts / 1000 / 3600;
 
-            // 2. Calcola grammi consumati in questo secondo: (mm3/s / 1000) * densità
-            const spoolIndex = updatedSpools.findIndex(
-              (s) => s.id === printer.loadedSpoolId
-            );
-            if (spoolIndex !== -1) {
-              const spool = updatedSpools[spoolIndex];
-              // Moltiplicatore visivo x4 per rendere ben percepibile lo scorrimento dei centesimi di grammo a schermo
-              const gramsPerSecond =
-                ((printer.flowRateMm3s / 1000) * spool.densityGcm3) * 4;
-              const newRemaining = Math.max(
+            // Scorrimento Grammi dalla Bobina associata
+            const spoolIdx = updatedSpools.findIndex((s) => s.id === printer.loadedSpoolId);
+            if (spoolIdx !== -1) {
+              const spool = updatedSpools[spoolIdx];
+              // Calcolo grammi/secondo da mm3/s * densità
+              const flow = printer.flowRateMm3s > 0 ? printer.flowRateMm3s : 12.0;
+              const gramsPerSecond = (flow / 1000) * spool.densityGcm3;
+              const nextWeight = Math.max(
                 0,
                 Number((spool.remainingWeightG - gramsPerSecond).toFixed(3))
               );
 
-              updatedSpools[spoolIndex] = {
+              updatedSpools[spoolIdx] = {
                 ...spool,
-                remainingWeightG: newRemaining,
+                remainingWeightG: nextWeight,
               };
 
-              // Controlla se scende sotto soglia per generare l'ordine in automatico
+              // Ordine automatico sotto soglia
               if (
-                newRemaining <= spool.reorderThresholdG &&
+                nextWeight <= spool.reorderThresholdG &&
                 !updatedOrders.some((o) => o.itemCode === spool.sku && o.status === 'PENDING')
               ) {
                 updatedOrders.unshift({
                   id: `ord-${Date.now()}`,
-                  createdAt: 'Adesso (Auto-Trigger)',
+                  createdAt: new Date().toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' }),
                   itemCode: spool.sku,
-                  description: `Riordino ${spool.brand} ${spool.material} ${spool.colorName} (Residuo < ${spool.reorderThresholdG}g)`,
+                  description: `Riordino Bobina ${spool.brand} ${spool.material} ${spool.colorName} (< ${spool.reorderThresholdG}g)`,
                   category: 'FILAMENT',
-                  priority: newRemaining < 100 ? 'CRITICAL' : 'HIGH',
+                  priority: nextWeight < 80 ? 'CRITICAL' : 'HIGH',
                   estimatedCost: spool.costPerKg,
                   status: 'PENDING',
                 });
               }
             }
 
-            // 3. Aggiorna avanzamento job e ore di manutenzione
             const newElapsed = printer.elapsedSeconds + 1;
-            const newProgress = Math.min(
-              100,
-              Number(((newElapsed / printer.estimatedTotalSeconds) * 100).toFixed(2))
-            );
-            const hourIncrement = 1 / 3600;
-
-            const updatedComponents = printer.components.map((comp) => {
-              const nextHours = Number((comp.currentHours + hourIncrement).toFixed(4));
-              return { ...comp, currentHours: nextHours };
-            });
+            const estTotal = printer.estimatedTotalSeconds > 0 ? printer.estimatedTotalSeconds : 10800;
+            const newProgress = Math.min(100, Number(((newElapsed / estTotal) * 100).toFixed(2)));
+            const hourInc = 1 / 3600;
 
             return {
               ...printer,
               currentWatts: liveWatts,
-              totalKwhConsumed: Number((printer.totalKwhConsumed + kwhAdded).toFixed(4)),
-              elapsedSeconds: newElapsed >= printer.estimatedTotalSeconds ? 0 : newElapsed,
-              progress: newProgress >= 100 ? 0 : newProgress,
-              totalPrintHours: Number((printer.totalPrintHours + hourIncrement).toFixed(3)),
-              components: updatedComponents,
+              totalKwhConsumed: Number((printer.totalKwhConsumed + kwhAdded).toFixed(5)),
+              elapsedSeconds: newElapsed >= estTotal ? 0 : newElapsed,
+              progress: printer.isLiveConnected ? printer.progress : newProgress,
+              totalPrintHours: Number((printer.totalPrintHours + hourInc).toFixed(3)),
+              components: printer.components.map((c) => ({
+                ...c,
+                currentHours: Number((c.currentHours + hourInc).toFixed(4)),
+              })),
             };
           });
 
-          const totalKwhTick = totalWattsThisSecond / 1000 / 3600;
-          const newSessionKwh = Number((state.sessionKwh + totalKwhTick).toFixed(5));
-          const newSessionCost = Number(
-            (newSessionKwh * state.electricityCostPerKwh).toFixed(4)
-          );
+          const tickKwh = totalWattsThisSecond / 1000 / 3600;
+          const nextSessionKwh = Number((state.sessionKwh + tickKwh).toFixed(5));
+          const nextSessionCost = Number((nextSessionKwh * state.electricityCostPerKwh).toFixed(4));
 
           return {
             printers: updatedPrinters,
             spools: updatedSpools,
             orders: updatedOrders,
-            sessionKwh: newSessionKwh,
-            sessionCostEur: newSessionCost,
+            sessionKwh: nextSessionKwh,
+            sessionCostEur: nextSessionCost,
           };
         }),
+
+      addPrinter: (newP) =>
+        set((state) => ({
+          printers: [
+            ...state.printers,
+            {
+              ...newP,
+              id: `pr-${Date.now()}`,
+              currentWatts: newP.status === 'PRINTING' ? newP.printingWattsConfig : newP.idleWattsConfig,
+              totalKwhConsumed: 0,
+              totalPrintHours: 0,
+              elapsedSeconds: 0,
+              isLiveConnected: false,
+              components: createDefaultComponents(0, 0, 0),
+            },
+          ],
+        })),
+
+      updatePrinter: (id, data) =>
+        set((state) => ({
+          printers: state.printers.map((p) => (p.id === id ? { ...p, ...data } : p)),
+        })),
+
+      deletePrinter: (id) =>
+        set((state) => ({
+          printers: state.printers.filter((p) => p.id !== id),
+        })),
 
       togglePrinterStatus: (printerId) =>
         set((state) => ({
           printers: state.printers.map((p) => {
             if (p.id !== printerId) return p;
-            const nextStatus: PrinterStatus =
-              p.status === 'PRINTING' ? 'IDLE' : 'PRINTING';
+            const nextStatus: PrinterStatus = p.status === 'PRINTING' ? 'IDLE' : 'PRINTING';
             return {
               ...p,
               status: nextStatus,
-              flowRateMm3s: nextStatus === 'PRINTING' ? 15.0 : 0,
+              flowRateMm3s: nextStatus === 'PRINTING' ? (p.flowRateMm3s || 14.0) : 0,
               nozzleTemp: nextStatus === 'PRINTING' ? 215 : 25,
               nozzleTarget: nextStatus === 'PRINTING' ? 215 : 0,
               bedTemp: nextStatus === 'PRINTING' ? 60 : 24,
               bedTarget: nextStatus === 'PRINTING' ? 60 : 0,
-              currentJobName:
-                nextStatus === 'PRINTING'
-                  ? 'lotto_produzione_serie_B.gcode'
-                  : 'In attesa di produzione',
-              estimatedTotalSeconds: p.estimatedTotalSeconds || 10800,
+              currentWatts: nextStatus === 'PRINTING' ? p.printingWattsConfig : p.idleWattsConfig,
             };
           }),
         })),
@@ -425,34 +503,28 @@ export const useErpStore = create<ErpState>()(
       assignSpoolToPrinter: (printerId, spoolId) =>
         set((state) => ({
           printers: state.printers.map((p) =>
-            p.id === printerId ? { ...p, loadedSpoolId: spoolId } : p
+            p.id === printerId ? { ...p, loadedSpoolId: spoolId || null } : p
           ),
-        })),
-
-      updatePrinterNetwork: (printerId, ipAddress, port, streamUrl) =>
-        set((state) => ({
-          printers: state.printers.map((p) =>
-            p.id === printerId ? { ...p, ipAddress, port, streamUrl } : p
-          ),
-        })),
-
-      addDiscoveredPrinter: (newP) =>
-        set((state) => ({
-          printers: [
-            ...state.printers,
-            {
-              ...newP,
-              id: `pr-${Date.now()}`,
-              totalPrintHours: 0,
-              totalKwhConsumed: 0,
-              components: createDefaultComponents(0, 0, 0),
-            },
-          ],
         })),
 
       addSpool: (spoolData) =>
         set((state) => ({
           spools: [...state.spools, { ...spoolData, id: `sp-${Date.now()}` }],
+        })),
+
+      updateSpoolWeight: (spoolId, newWeightG) =>
+        set((state) => ({
+          spools: state.spools.map((s) =>
+            s.id === spoolId ? { ...s, remainingWeightG: Math.max(0, newWeightG) } : s
+          ),
+        })),
+
+      deleteSpool: (spoolId) =>
+        set((state) => ({
+          spools: state.spools.filter((s) => s.id !== spoolId),
+          printers: state.printers.map((p) =>
+            p.loadedSpoolId === spoolId ? { ...p, loadedSpoolId: null } : p
+          ),
         })),
 
       refillSpool: (spoolId) =>
@@ -482,6 +554,23 @@ export const useErpStore = create<ErpState>()(
           ),
         })),
 
+      addManualOrder: (description, category, estimatedCost, priority) =>
+        set((state) => ({
+          orders: [
+            {
+              id: `ord-${Date.now()}`,
+              createdAt: new Date().toLocaleDateString('it-IT'),
+              itemCode: category === 'FILAMENT' ? 'MAN-FIL' : 'MAN-PART',
+              description,
+              category,
+              priority,
+              estimatedCost,
+              status: 'PENDING',
+            },
+            ...state.orders,
+          ],
+        })),
+
       markOrderAsOrdered: (orderId) =>
         set((state) => ({
           orders: state.orders.map((o) =>
@@ -497,7 +586,7 @@ export const useErpStore = create<ErpState>()(
       setElectricityRate: (rate) => set({ electricityCostPerKwh: rate }),
     }),
     {
-      name: 'enterprise-3d-erp-v3',
+      name: 'enterprise-3d-erp-v4',
     }
   )
 );

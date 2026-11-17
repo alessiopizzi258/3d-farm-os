@@ -21,8 +21,10 @@ import {
   Trash2,
   QrCode,
   Video,
+  X,
+  Edit3,
 } from 'lucide-react';
-import { useErpStore } from '@/store/useErpStore';
+import { useErpStore, PrinterUnit, PrinterBrand } from '@/store/useErpStore';
 
 type ActiveModule = 'fleet' | 'inventory' | 'energy' | 'maintenance';
 
@@ -35,10 +37,18 @@ export default function EnterpriseMesDashboard() {
     sessionKwh,
     sessionCostEur,
     tickRealTimeTelemetry,
+    pollRealHardware,
+    addPrinter,
+    updatePrinter,
+    deletePrinter,
     togglePrinterStatus,
     assignSpoolToPrinter,
+    addSpool,
+    updateSpoolWeight,
+    deleteSpool,
     refillSpool,
     resetComponentWear,
+    addManualOrder,
     markOrderAsOrdered,
     deleteOrder,
     setElectricityRate,
@@ -46,12 +56,48 @@ export default function EnterpriseMesDashboard() {
 
   const [activeModule, setActiveModule] = useState<ActiveModule>('fleet');
   const [isScanningLan, setIsScanningLan] = useState(false);
-  const [scanProgress, setScanProgress] = useState(0);
-  const [scanLog, setScanLog] = useState<string | null>(null);
+  const [scanLogs, setScanLogs] = useState<string[]>([]);
   const [showCams, setShowCams] = useState(false);
   const [isMounted, setIsMounted] = useState(false);
 
-  // Avvio del motore real-time a 1Hz (ogni secondo aggiorna grammi, Watt, kWh e ore usura)
+  // STATI MODAL: INSERIMENTO BOBINA FILAMENTO
+  const [isSpoolModalOpen, setIsSpoolModalOpen] = useState(false);
+  const [spoolForm, setSpoolForm] = useState({
+    sku: 'FIL-NEW-01',
+    brand: 'Anycubic',
+    material: 'PLA' as 'PLA' | 'PETG' | 'ASA' | 'ABS' | 'TPU',
+    colorName: 'Nero',
+    colorHex: '#2563eb',
+    initialWeightG: 1000,
+    remainingWeightG: 1000,
+    costPerKg: 19.0,
+    reorderThresholdG: 200,
+    nfcUid: 'TAG-NEW',
+  });
+
+  // STATI MODAL: CONFIGURA / AGGIUNGI STAMPANTE
+  const [isPrinterModalOpen, setIsPrinterModalOpen] = useState(false);
+  const [editingPrinterId, setEditingPrinterId] = useState<string | null>(null);
+  const [printerForm, setPrinterForm] = useState({
+    code: 'ANYCUBIC-04',
+    brand: 'Anycubic' as PrinterBrand,
+    model: 'Kobra 3',
+    ipAddress: '192.168.1.105',
+    port: 7125,
+    apiType: 'Moonraker' as 'Moonraker' | 'OctoPrint' | 'Manuale',
+    smartPlugIp: '',
+    printingWattsConfig: 195,
+    idleWattsConfig: 12,
+    ratedMaxWatts: 400,
+    flowRateMm3s: 12.5,
+    streamUrl: 'http://192.168.1.105:8080/?action=stream',
+  });
+
+  // STATI MODAL: NUOVO ORDINE MANUALE
+  const [newOrderDesc, setNewOrderDesc] = useState('');
+  const [newOrderCost, setNewOrderCost] = useState(20);
+
+  // Avvio del motore a 1Hz (ogni secondo aggiorna grammi, Watt, kWh e ore usura)
   useEffect(() => {
     setIsMounted(true);
     const interval = setInterval(() => {
@@ -70,139 +116,203 @@ export default function EnterpriseMesDashboard() {
   const activePrintersCount = printers.filter((p) => p.status === 'PRINTING').length;
   const pendingOrdersCount = orders.filter((o) => o.status === 'PENDING').length;
 
-  // Simulazione / Ping Scanner di Rete Locale per Anycubic & Creality
-  const handleNetworkDiscovery = () => {
+  // Scansione reale HTTP verso gli IP configurati
+  const handleRealNetworkPoll = async () => {
     setIsScanningLan(true);
-    setScanProgress(10);
-    setScanLog('Scansione subnet 192.168.1.1/24 (Porte 7125 Moonraker / 4408 Creality / 80)...');
+    setScanLogs(['Avvio interrogazione HTTP verso gli IP configurati...']);
+    const result = await pollRealHardware();
+    setScanLogs(result.details);
+    setIsScanningLan(false);
+  };
 
-    setTimeout(() => {
-      setScanProgress(45);
-      setScanLog('Trovati 3 nodi Anycubic (192.168.1.101, .102, .103) - Handshake OK');
-    }, 900);
+  // Apertura Modal Modifica Stampante esistente
+  const openEditPrinter = (p: PrinterUnit) => {
+    setEditingPrinterId(p.id);
+    setPrinterForm({
+      code: p.code,
+      brand: p.brand,
+      model: p.model,
+      ipAddress: p.ipAddress,
+      port: p.port,
+      apiType: p.apiType,
+      smartPlugIp: p.smartPlugIp || '',
+      printingWattsConfig: p.printingWattsConfig || 190,
+      idleWattsConfig: p.idleWattsConfig || 12,
+      ratedMaxWatts: p.ratedMaxWatts || 400,
+      flowRateMm3s: p.flowRateMm3s > 0 ? p.flowRateMm3s : 12.5,
+      streamUrl: p.streamUrl,
+    });
+    setIsPrinterModalOpen(true);
+  };
 
-    setTimeout(() => {
-      setScanProgress(85);
-      setScanLog('Trovato 1 nodo Creality K1/Klippper (192.168.1.104:4408) - Telemetria sincronizzata');
-    }, 1800);
+  // Apertura Modal Nuova Stampante
+  const openNewPrinter = () => {
+    setEditingPrinterId(null);
+    setPrinterForm({
+      code: `PRINTER-0${printers.length + 1}`,
+      brand: 'Anycubic',
+      model: 'Kobra 2 / 3',
+      ipAddress: '192.168.1.110',
+      port: 7125,
+      apiType: 'Moonraker',
+      smartPlugIp: '',
+      printingWattsConfig: 190,
+      idleWattsConfig: 12,
+      ratedMaxWatts: 400,
+      flowRateMm3s: 12.0,
+      streamUrl: 'http://192.168.1.110:8080/?action=stream',
+    });
+    setIsPrinterModalOpen(true);
+  };
 
-    setTimeout(() => {
-      setScanProgress(100);
-      setIsScanningLan(false);
-      setTimeout(() => setScanLog(null), 4000);
-    }, 2500);
+  const handleSavePrinter = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (editingPrinterId) {
+      updatePrinter(editingPrinterId, {
+        ...printerForm,
+      });
+    } else {
+      addPrinter({
+        ...printerForm,
+        status: 'IDLE',
+        loadedSpoolId: spools[0]?.id || null,
+        currentJobName: 'Pronta',
+        progress: 0,
+        estimatedTotalSeconds: 10800,
+        nozzleTemp: 24,
+        nozzleTarget: 0,
+        bedTemp: 24,
+        bedTarget: 0,
+      });
+    }
+    setIsPrinterModalOpen(false);
+  };
+
+  const handleSaveSpool = (e: React.FormEvent) => {
+    e.preventDefault();
+    const densityMap = { PLA: 1.24, PETG: 1.27, ASA: 1.07, ABS: 1.04, TPU: 1.21 };
+    addSpool({
+      ...spoolForm,
+      densityGcm3: densityMap[spoolForm.material] || 1.24,
+    });
+    setIsSpoolModalOpen(false);
   };
 
   return (
     <div className="h-[100dvh] w-full bg-[#09090b] text-zinc-100 flex flex-col overflow-hidden select-none">
       
       {/* =====================================================================
-          TOP BAR ENTERPRISE: TELEMETRIA ELETTRICA & LAN DISCOVERY
+          TOP BAR ENTERPRISE: CORRENTE IN TEMPO REALE + BOTTONI RAPIDI
       ===================================================================== */}
       <header className="bg-[#121215] border-b border-zinc-800 px-4 lg:px-6 py-3 shrink-0">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          {/* Brand Aziendale */}
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded bg-blue-600 flex items-center justify-center font-mono-tech font-bold text-sm tracking-tighter">
-              MES
+            <div className="w-8 h-8 rounded bg-blue-600 flex items-center justify-center font-mono-tech font-bold text-sm">
+              ERP
             </div>
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-sm sm:text-base font-semibold tracking-tight text-white">
-                  ADDITIVE ERP // CONTROL SUITE
+                  3D FARM // SISTEMA GESTIONALE
                 </h1>
-                <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono-tech bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono-tech bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
-                  LIVE 1Hz
+                  {activePrintersCount} ATTIVE SU {printers.length}
                 </span>
               </div>
               <p className="text-[11px] text-zinc-400 font-mono-tech">
-                Flotta configurata: 3x Anycubic + 1x Creality
+                Clicca &quot;Avvia/Pausa&quot; o &quot;Configura&quot; su ogni stampante per allineare lo stato reale
               </p>
             </div>
           </div>
 
-          {/* KPI Strip Real-Time (Corrente, Costo Orario, Flotta) */}
-          <div className="flex items-center gap-2 sm:gap-4 overflow-x-auto py-1">
-            <div className="bg-[#09090b] border border-zinc-800 px-3 py-1.5 rounded flex items-center gap-2.5">
+          {/* KPI Elettrici + Azioni Rapide */}
+          <div className="flex items-center gap-2 sm:gap-3 overflow-x-auto py-1">
+            <div className="bg-[#09090b] border border-zinc-800 px-3 py-1.5 rounded flex items-center gap-2">
               <Zap size={15} className="text-amber-400 shrink-0" />
               <div>
-                <div className="text-[10px] uppercase text-zinc-400 font-medium">
-                  Assorbimento Live
-                </div>
-                <div className="text-xs sm:text-sm font-mono-tech font-semibold text-white">
+                <div className="text-[10px] uppercase text-zinc-400">Corrente Live</div>
+                <div className="text-xs sm:text-sm font-mono-tech font-bold text-amber-400">
                   {totalLiveWatts} W{' '}
                   <span className="text-zinc-400 font-normal">
-                    ({(totalLiveWatts / 1000).toFixed(2)} kW)
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="bg-[#09090b] border border-zinc-800 px-3 py-1.5 rounded flex items-center gap-2.5">
-              <div className="text-emerald-400 font-mono-tech font-bold text-xs px-1.5 py-0.5 bg-emerald-500/10 rounded">
-                €
-              </div>
-              <div>
-                <div className="text-[10px] uppercase text-zinc-400 font-medium">
-                  Costo Elettrico Live
-                </div>
-                <div className="text-xs sm:text-sm font-mono-tech font-semibold text-emerald-400">
-                  € {hourlyCostEur.toFixed(3)}/h{' '}
-                  <span className="text-zinc-400 text-xs font-normal">
-                    (Tot: € {sessionCostEur.toFixed(3)})
+                    (€ {hourlyCostEur.toFixed(3)}/h)
                   </span>
                 </div>
               </div>
             </div>
 
             <button
-              onClick={handleNetworkDiscovery}
-              disabled={isScanningLan}
-              className="bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 text-white text-xs font-medium px-3.5 py-2 rounded flex items-center gap-2 transition-colors shrink-0 cursor-pointer"
+              onClick={() => setIsSpoolModalOpen(true)}
+              className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium px-3 py-2 rounded flex items-center gap-1.5 transition-colors shrink-0 cursor-pointer"
             >
-              <Radar size={15} className={isScanningLan ? 'animate-spin' : ''} />
-              <span>{isScanningLan ? `Scan ${scanProgress}%` : 'Scan Rete LAN'}</span>
+              <Plus size={14} />
+              <span>+ Bobina Filamento</span>
+            </button>
+
+            <button
+              onClick={openNewPrinter}
+              className="bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-100 text-xs font-medium px-3 py-2 rounded flex items-center gap-1.5 transition-colors shrink-0 cursor-pointer"
+            >
+              <Settings size={14} />
+              <span>+ Stampante</span>
+            </button>
+
+            <button
+              onClick={handleRealNetworkPoll}
+              disabled={isScanningLan}
+              className="bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium px-3 py-2 rounded flex items-center gap-1.5 transition-colors shrink-0 cursor-pointer"
+            >
+              <Radar size={14} className={isScanningLan ? 'animate-spin' : ''} />
+              <span>{isScanningLan ? 'Verifica IP...' : 'Testa IP LAN'}</span>
             </button>
           </div>
         </div>
 
-        {/* Barra di stato Discovery Rete */}
-        {scanLog && (
-          <div className="mt-2.5 px-3 py-1.5 bg-blue-950/40 border border-blue-800/50 rounded flex items-center justify-between text-xs font-mono-tech text-blue-300">
-            <span>{scanLog}</span>
-            <span className="text-[10px] uppercase">TCP/IP Auto-Discovery</span>
+        {/* Risultati Test Connessione LAN */}
+        {scanLogs.length > 0 && (
+          <div className="mt-2.5 p-2.5 bg-zinc-900 border border-zinc-700 rounded text-xs font-mono-tech space-y-1">
+            <div className="flex items-center justify-between text-zinc-400 pb-1 border-b border-zinc-800">
+              <span>DIAGNOSTICA DI RETE (Moonraker / Prese Smart):</span>
+              <button onClick={() => setScanLogs([])} className="text-zinc-400 hover:text-white">
+                Chiudi ✕
+              </button>
+            </div>
+            {scanLogs.map((l, idx) => (
+              <div key={idx} className="text-[11px] text-blue-300">
+                • {l}
+              </div>
+            ))}
           </div>
         )}
       </header>
 
       {/* =====================================================================
-          CORPO CENTRALE (SIDEBAR DESKTOP + WORKSPACE)
+          CORPO CENTRALE (SIDEBAR + WORKSPACE)
       ===================================================================== */}
       <div className="flex-grow flex overflow-hidden">
         
-        {/* SIDEBAR DI NAVIGAZIONE (Desktop lg+) */}
+        {/* SIDEBAR DESKTOP */}
         <aside className="hidden lg:flex w-60 bg-[#121215] border-r border-zinc-800 flex-col justify-between p-3 shrink-0">
           <nav className="space-y-1">
             <div className="px-3 py-2 text-[10px] font-mono-tech uppercase tracking-wider text-zinc-400">
-              Moduli Operativi
+              Reparti Operativi
             </div>
             {[
               {
                 id: 'fleet',
-                label: 'Flotta Stampanti (4)',
+                label: 'Stampanti & Stato',
                 icon: Server,
-                badge: `${activePrintersCount}/4`,
+                badge: `${activePrintersCount}/${printers.length} ON`,
               },
               {
                 id: 'inventory',
-                label: 'Flusso Filamenti Live',
+                label: 'Magazzino Filamenti',
                 icon: Layers,
-                badge: `${spools.length} SKU`,
+                badge: `${spools.length} Bobine`,
               },
               {
                 id: 'energy',
-                label: 'Telemetria Elettrica',
+                label: 'Consumo Corrente',
                 icon: Zap,
                 badge: `${totalLiveWatts}W`,
               },
@@ -210,7 +320,7 @@ export default function EnterpriseMesDashboard() {
                 id: 'maintenance',
                 label: 'Manutenzione & Ordini',
                 icon: Wrench,
-                badge: pendingOrdersCount > 0 ? `${pendingOrdersCount} Alert` : 'OK',
+                badge: `${pendingOrdersCount} Ord.`,
               },
             ].map((item) => {
               const Icon = item.icon;
@@ -219,7 +329,7 @@ export default function EnterpriseMesDashboard() {
                 <button
                   key={item.id}
                   onClick={() => setActiveModule(item.id as ActiveModule)}
-                  className={`w-full flex items-center justify-between px-3 py-2.5 rounded text-xs font-medium transition-colors ${
+                  className={`w-full flex items-center justify-between px-3 py-2.5 rounded text-xs font-medium transition-colors cursor-pointer ${
                     isActive
                       ? 'bg-zinc-800 text-white border-l-2 border-blue-500'
                       : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'
@@ -237,75 +347,63 @@ export default function EnterpriseMesDashboard() {
             })}
           </nav>
 
-          {/* Riepilogo Inferiore Sidebar */}
-          <div className="p-3 bg-[#09090b] border border-zinc-800 rounded space-y-2">
-            <div className="flex items-center justify-between text-[11px] text-zinc-400">
-              <span>Protocollo</span>
-              <span className="font-mono-tech text-zinc-200">Moonraker / HTTP</span>
-            </div>
-            <div className="flex items-center justify-between text-[11px] text-zinc-400">
-              <span>Consumo Sessione</span>
-              <span className="font-mono-tech text-amber-400">
-                {sessionKwh.toFixed(3)} kWh
-              </span>
-            </div>
-            <div className="flex items-center justify-between text-[11px] text-zinc-400">
-              <span>Tariffa Energia</span>
-              <span className="font-mono-tech text-emerald-400">
-                € {electricityCostPerKwh.toFixed(2)}/kWh
-              </span>
-            </div>
+          <div className="p-3 bg-[#09090b] border border-zinc-800 rounded space-y-2 text-[11px]">
+            <div className="text-zinc-400 font-semibold">Come funziona la Corrente:</div>
+            <p className="text-zinc-500 leading-relaxed">
+              Ogni stampante in stato <strong className="text-emerald-400">PRINTING</strong> assorbe i Watt impostati nella sua scheda (es. 190W) o letti dalla presa Shelly IP, calcolando kWh ed Euro al secondo.
+            </p>
           </div>
         </aside>
 
-        {/* WORKSPACE PRINCIPALE SCORREVOLE */}
+        {/* WORKSPACE PRINCIPALE */}
         <main className="flex-grow overflow-y-auto p-4 lg:p-6 space-y-6">
           
           {/* ===============================================================
-              MODULO 1: FLOTTA STAMPANTI (3 ANYCUBIC + 1 CREALITY)
+              MODULO 1: FLOTTA STAMPANTI (CON CONFIGURAZIONE IP E STATO)
           =============================================================== */}
           {activeModule === 'fleet' && (
             <div className="space-y-5">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 pb-4">
                 <div>
                   <h2 className="text-lg font-semibold text-white">
-                    Stato Nodi di Produzione (3 Anycubic, 1 Creality)
+                    Controllo Stampanti ({activePrintersCount} in stampa attiva)
                   </h2>
                   <p className="text-xs text-zinc-400">
-                    Monitoraggio estrusione al secondo, consumo bobina in tempo reale e controllo termico PID.
+                    Premi il pulsante <strong className="text-emerald-400">Play / Pausa</strong> su una stampante per attivarla/fermarla subito, oppure clicca l&apos;icona <strong className="text-blue-400">Ingranaggio</strong> per inserire il suo IP reale o i Watt.
                   </p>
                 </div>
 
-                <button
-                  onClick={() => setShowCams(!showCams)}
-                  className={`px-3 py-1.5 rounded text-xs font-medium border flex items-center gap-2 transition-colors ${
-                    showCams
-                      ? 'bg-blue-600/20 border-blue-500 text-blue-300'
-                      : 'bg-[#121215] border-zinc-800 text-zinc-300 hover:bg-zinc-800'
-                  }`}
-                >
-                  <Video size={14} />
-                  <span>{showCams ? 'Nascondi Stream IP' : 'Mostra Stream Telecamere IP'}</span>
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setShowCams(!showCams)}
+                    className="px-3 py-1.5 rounded text-xs font-medium border bg-[#121215] border-zinc-800 text-zinc-300 hover:bg-zinc-800 flex items-center gap-2 cursor-pointer"
+                  >
+                    <Video size={14} />
+                    <span>{showCams ? 'Nascondi Telecamere' : 'Mostra Telecamere'}</span>
+                  </button>
+                </div>
               </div>
 
-              {/* Griglia 4 Stampanti */}
               <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
                 {printers.map((printer) => {
-                  const loadedSpool = spools.find(
-                    (s) => s.id === printer.loadedSpoolId
-                  );
-                  const gramsPerSec = loadedSpool
-                    ? ((printer.flowRateMm3s / 1000) * loadedSpool.densityGcm3) * 4
-                    : 0;
+                  const loadedSpool = spools.find((s) => s.id === printer.loadedSpoolId);
+                  const flow = printer.flowRateMm3s > 0 ? printer.flowRateMm3s : 12.0;
+                  const gramsPerMin =
+                    printer.status === 'PRINTING' && loadedSpool
+                      ? (flow / 1000) * loadedSpool.densityGcm3 * 60
+                      : 0;
 
                   return (
                     <div
                       key={printer.id}
-                      className="bg-[#121215] border border-zinc-800 rounded-lg p-4 flex flex-col justify-between space-y-4"
+                      className={`bg-[#121215] border rounded-lg p-4 flex flex-col justify-between space-y-4 transition-colors ${
+                        printer.status === 'PRINTING'
+                          ? 'border-emerald-500/40'
+                          : 'border-zinc-800'
+                      }`}
                     >
-                      {/* Riga 1: Intestazione Macchina, IP e Stato */}
-                      <div className="flex items-start justify-between gap-2 border-b border-zinc-800/80 pb-3">
+                      {/* Intestazione + Bottoni Azione */}
+                      <div className="flex items-start justify-between gap-2 border-b border-zinc-800 pb-3">
                         <div>
                           <div className="flex items-center gap-2">
                             <span
@@ -325,50 +423,52 @@ export default function EnterpriseMesDashboard() {
                             {printer.model}
                           </h3>
                           <div className="flex items-center gap-2 text-[11px] font-mono-tech text-zinc-400 mt-0.5">
-                            <Wifi size={12} className="text-emerald-400" />
+                            <Wifi
+                              size={12}
+                              className={
+                                printer.isLiveConnected ? 'text-emerald-400' : 'text-zinc-500'
+                              }
+                            />
                             <span>
-                              {printer.ipAddress}:{printer.port} ({printer.apiType})
+                              IP: {printer.ipAddress}:{printer.port}
                             </span>
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-2">
-                          <span
-                            className={`px-2.5 py-1 rounded text-[11px] font-mono-tech font-semibold flex items-center gap-1.5 ${
-                              printer.status === 'PRINTING'
-                                ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-                                : 'bg-zinc-800 text-zinc-300'
-                            }`}
-                          >
-                            <span
-                              className={`w-1.5 h-1.5 rounded-full ${
-                                printer.status === 'PRINTING'
-                                  ? 'bg-emerald-400 animate-ping'
-                                  : 'bg-zinc-400'
-                              }`}
-                            />
-                            {printer.status}
-                          </span>
-
+                        {/* Controlli rapidi: Avvia/Ferma + Configura */}
+                        <div className="flex items-center gap-1.5">
                           <button
                             onClick={() => togglePrinterStatus(printer.id)}
-                            className="p-2 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 transition-colors"
-                            title={
+                            className={`px-3 py-1.5 rounded text-xs font-mono-tech font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
                               printer.status === 'PRINTING'
-                                ? 'Metti in Pausa / Idle'
-                                : 'Avvia Produzione'
-                            }
+                                ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                                : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-200'
+                            }`}
                           >
                             {printer.status === 'PRINTING' ? (
-                              <Pause size={14} />
+                              <>
+                                <Pause size={13} />
+                                <span>IN STAMPA</span>
+                              </>
                             ) : (
-                              <Play size={14} />
+                              <>
+                                <Play size={13} />
+                                <span>AVVIA STAMPA</span>
+                              </>
                             )}
+                          </button>
+
+                          <button
+                            onClick={() => openEditPrinter(printer)}
+                            className="p-2 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors cursor-pointer"
+                            title="Modifica IP, Modello e Watt"
+                          >
+                            <Settings size={14} />
                           </button>
                         </div>
                       </div>
 
-                      {/* Stream Telecamera Opzionale */}
+                      {/* Stream Telecamera */}
                       {showCams && (
                         <div className="aspect-video bg-black rounded border border-zinc-800 relative overflow-hidden flex items-center justify-center">
                           <img
@@ -380,65 +480,44 @@ export default function EnterpriseMesDashboard() {
                             }}
                           />
                           <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-4 pointer-events-none">
-                            <span className="font-mono-tech text-xs text-zinc-500">
-                              STREAM MJPEG: {printer.streamUrl}
-                            </span>
-                            <span className="text-[11px] text-zinc-600 mt-1">
-                              (Visibile quando connesso alla stessa rete LAN locale delle stampanti)
+                            <span className="font-mono-tech text-xs text-zinc-400">
+                              Flusso Camera: {printer.streamUrl}
                             </span>
                           </div>
                         </div>
                       )}
 
-                      {/* Riga 2: Avanzamento G-Code */}
-                      <div className="bg-[#09090b] border border-zinc-800/90 rounded p-3 space-y-2">
-                        <div className="flex items-center justify-between text-xs">
-                          <span className="font-mono-tech text-zinc-300 truncate max-w-[230px] sm:max-w-xs">
-                            {printer.currentJobName}
-                          </span>
-                          <span className="font-mono-tech font-bold text-blue-400">
-                            {printer.progress.toFixed(2)}%
-                          </span>
-                        </div>
-                        <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden">
-                          <div
-                            className="h-full bg-blue-500 transition-all duration-500"
-                            style={{ width: `${printer.progress}%` }}
-                          />
-                        </div>
-                      </div>
-
-                      {/* Riga 3: SCORRIMENTO FILAMENTO IN TEMPO REALE */}
-                      <div className="bg-[#09090b] border border-zinc-800/90 rounded p-3">
-                        <div className="flex items-center justify-between mb-2">
+                      {/* Selezione Bobina Caricata e Scorrimento Grammi */}
+                      <div className="bg-[#09090b] border border-zinc-800 rounded p-3 space-y-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
                           <span className="text-[11px] uppercase tracking-wider text-zinc-400 font-medium">
-                            Bobina in Uso & Scorrimento Real-Time
+                            Bobina Montata sulla Macchina:
                           </span>
                           <select
                             value={printer.loadedSpoolId || ''}
                             onChange={(e) =>
-                              assignSpoolToPrinter(printer.id, e.target.value)
+                              assignSpoolToPrinter(printer.id, e.target.value || null)
                             }
-                            className="bg-zinc-900 border border-zinc-700 rounded text-xs px-2 py-0.5 text-zinc-200 font-mono-tech outline-none"
+                            className="bg-zinc-900 border border-zinc-700 rounded text-xs px-2.5 py-1 text-white font-mono-tech outline-none cursor-pointer"
                           >
+                            <option value="">-- Nessuna Bobina --</option>
                             {spools.map((sp) => (
                               <option key={sp.id} value={sp.id}>
-                                {sp.sku} ({sp.remainingWeightG.toFixed(1)}g)
+                                {sp.brand} {sp.material} {sp.colorName} ({sp.remainingWeightG.toFixed(1)}g)
                               </option>
                             ))}
                           </select>
                         </div>
 
-                        {loadedSpool && (
+                        {loadedSpool ? (
                           <div className="space-y-1.5">
                             <div className="flex items-center justify-between text-xs">
-                              <span className="flex items-center gap-2 font-medium text-zinc-200">
+                              <span className="flex items-center gap-2 text-zinc-300">
                                 <span
                                   className="w-3 h-3 rounded-full border border-white/20"
                                   style={{ backgroundColor: loadedSpool.colorHex }}
                                 />
-                                {loadedSpool.brand} {loadedSpool.material} -{' '}
-                                {loadedSpool.colorName}
+                                Residuo Bobina in tempo reale:
                               </span>
                               <span className="font-mono-tech text-sm font-bold text-amber-400">
                                 {loadedSpool.remainingWeightG.toFixed(2)} g
@@ -449,75 +528,67 @@ export default function EnterpriseMesDashboard() {
                               </span>
                             </div>
 
-                            {/* Barra progressiva bobina */}
                             <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden">
                               <div
                                 className={`h-full transition-all duration-300 ${
-                                  loadedSpool.remainingWeightG <
-                                  loadedSpool.reorderThresholdG
+                                  loadedSpool.remainingWeightG <= loadedSpool.reorderThresholdG
                                     ? 'bg-red-500'
                                     : 'bg-emerald-500'
                                 }`}
                                 style={{
-                                  width: `${
-                                    (loadedSpool.remainingWeightG /
-                                      loadedSpool.initialWeightG) *
-                                    100
-                                  }%`,
+                                  width: `${Math.min(
+                                    100,
+                                    (loadedSpool.remainingWeightG / loadedSpool.initialWeightG) * 100
+                                  )}%`,
                                 }}
                               />
                             </div>
 
-                            <div className="flex items-center justify-between text-[11px] font-mono-tech text-zinc-400 pt-0.5">
-                              <span>
-                                Flusso Estrusore: {printer.flowRateMm3s.toFixed(1)} mm³/s
-                              </span>
-                              <span className="text-amber-400">
-                                Consumo: -{gramsPerSec.toFixed(3)} g/sec
+                            <div className="flex items-center justify-between text-[11px] font-mono-tech text-zinc-400">
+                              <span>Velocità estrusione: {printer.flowRateMm3s} mm³/s</span>
+                              <span className="text-emerald-400">
+                                {printer.status === 'PRINTING'
+                                  ? `Scala -${gramsPerMin.toFixed(2)} g/min`
+                                  : 'Ferma (0 g/min)'}
                               </span>
                             </div>
+                          </div>
+                        ) : (
+                          <div className="text-xs text-amber-400 font-mono-tech py-1">
+                            ⚠ Seleziona una bobina dal menu a tendina qui sopra per scalare i grammi.
                           </div>
                         )}
                       </div>
 
-                      {/* Riga 4: Telemetria Termica ed Elettrica */}
-                      <div className="grid grid-cols-3 gap-2 pt-1">
-                        <div className="bg-[#09090b] border border-zinc-800/80 rounded p-2.5">
+                      {/* Temperature e Corrente Assorbita */}
+                      <div className="grid grid-cols-3 gap-2">
+                        <div className="bg-[#09090b] border border-zinc-800 rounded p-2.5">
                           <div className="flex items-center gap-1 text-[10px] text-zinc-400 uppercase">
                             <Flame size={12} className="text-orange-400" />
-                            <span>Hotend</span>
+                            <span>Ugello</span>
                           </div>
                           <div className="font-mono-tech text-xs sm:text-sm font-semibold text-white mt-0.5">
-                            {printer.nozzleTemp}°C{' '}
-                            <span className="text-zinc-500 text-[11px]">
-                              / {printer.nozzleTarget}°
-                            </span>
+                            {printer.nozzleTemp}°C
                           </div>
                         </div>
 
-                        <div className="bg-[#09090b] border border-zinc-800/80 rounded p-2.5">
+                        <div className="bg-[#09090b] border border-zinc-800 rounded p-2.5">
                           <div className="flex items-center gap-1 text-[10px] text-zinc-400 uppercase">
                             <Thermometer size={12} className="text-blue-400" />
                             <span>Piatto</span>
                           </div>
                           <div className="font-mono-tech text-xs sm:text-sm font-semibold text-white mt-0.5">
-                            {printer.bedTemp}°C{' '}
-                            <span className="text-zinc-500 text-[11px]">
-                              / {printer.bedTarget}°
-                            </span>
+                            {printer.bedTemp}°C
                           </div>
                         </div>
 
-                        <div className="bg-[#09090b] border border-zinc-800/80 rounded p-2.5">
+                        <div className="bg-[#09090b] border border-zinc-800 rounded p-2.5">
                           <div className="flex items-center gap-1 text-[10px] text-zinc-400 uppercase">
                             <Zap size={12} className="text-amber-400" />
-                            <span>Potenza</span>
+                            <span>Assorbimento</span>
                           </div>
                           <div className="font-mono-tech text-xs sm:text-sm font-semibold text-amber-400 mt-0.5">
-                            {printer.currentWatts} W{' '}
-                            <span className="text-zinc-500 text-[11px]">
-                              ({printer.totalKwhConsumed.toFixed(1)}kWh)
-                            </span>
+                            {printer.currentWatts} W
                           </div>
                         </div>
                       </div>
@@ -529,58 +600,53 @@ export default function EnterpriseMesDashboard() {
           )}
 
           {/* ===============================================================
-              MODULO 2: MAGAZZINO FILAMENTI CON SCORRIMENTO LIVE
+              MODULO 2: MAGAZZINO FILAMENTI (CON AGGIUNTA E MODIFICA GRAMMI)
           =============================================================== */}
           {activeModule === 'inventory' && (
             <div className="space-y-5">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 pb-4">
                 <div>
                   <h2 className="text-lg font-semibold text-white">
-                    Inventario Bobine & Tracciamento Scorrimento Grammi
+                    Magazzino Filamenti ({spools.length} Bobine registrate)
                   </h2>
                   <p className="text-xs text-zinc-400">
-                    I grammi residui vengono scalati al secondo dalle stampanti attive. Sotto i 250g scatta l&apos;ordine d&apos;acquisto automatico.
+                    Aggiungi nuove bobine, modifica manualmente i grammi residui o ricarica a 1000g con un clic.
                   </p>
                 </div>
+
+                <button
+                  onClick={() => setIsSpoolModalOpen(true)}
+                  className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium px-3.5 py-2 rounded flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <Plus size={15} />
+                  <span>Aggiungi Nuova Bobina</span>
+                </button>
               </div>
 
               <div className="bg-[#121215] border border-zinc-800 rounded-lg overflow-x-auto">
                 <table className="w-full text-left border-collapse">
                   <thead>
                     <tr className="border-b border-zinc-800 text-[11px] font-mono-tech uppercase text-zinc-400 bg-[#09090b]">
-                      <th className="py-3 px-4">SKU / Tag NFC</th>
-                      <th className="py-3 px-4">Polimero & Brand</th>
-                      <th className="py-3 px-4">Macchina Associata</th>
-                      <th className="py-3 px-4">Scorrimento Peso Real-Time</th>
-                      <th className="py-3 px-4">Valore Residuo</th>
+                      <th className="py-3 px-4">Codice / NFC</th>
+                      <th className="py-3 px-4">Marca & Materiale</th>
+                      <th className="py-3 px-4">Montata Su</th>
+                      <th className="py-3 px-4">Grammi Residui (Modificabili)</th>
                       <th className="py-3 px-4 text-right">Azioni</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-zinc-800/80 text-xs">
+                  <tbody className="divide-y divide-zinc-800 text-xs">
                     {spools.map((spool) => {
-                      const usedByPrinter = printers.find(
-                        (p) => p.loadedSpoolId === spool.id
+                      const mountedOn = printers.find((p) => p.loadedSpoolId === spool.id);
+                      const pct = Math.min(
+                        100,
+                        (spool.remainingWeightG / spool.initialWeightG) * 100
                       );
-                      const isDepleting =
-                        usedByPrinter && usedByPrinter.status === 'PRINTING';
-                      const pct =
-                        (spool.remainingWeightG / spool.initialWeightG) * 100;
-                      const residualEur =
-                        (spool.remainingWeightG / 1000) * spool.costPerKg;
 
                       return (
-                        <tr
-                          key={spool.id}
-                          className="hover:bg-zinc-800/30 transition-colors"
-                        >
+                        <tr key={spool.id} className="hover:bg-zinc-800/30">
                           <td className="py-3.5 px-4 font-mono-tech">
-                            <div className="font-semibold text-white">
-                              {spool.sku}
-                            </div>
-                            <div className="text-[11px] text-zinc-500 flex items-center gap-1 mt-0.5">
-                              <QrCode size={11} />
-                              <span>NFC: {spool.nfcUid}</span>
-                            </div>
+                            <div className="font-semibold text-white">{spool.sku}</div>
+                            <div className="text-[11px] text-zinc-500">NFC: {spool.nfcUid}</div>
                           </td>
 
                           <td className="py-3.5 px-4">
@@ -590,74 +656,69 @@ export default function EnterpriseMesDashboard() {
                                 style={{ backgroundColor: spool.colorHex }}
                               />
                               <div>
-                                <div className="font-semibold text-zinc-100">
+                                <div className="font-semibold text-white">
                                   {spool.brand} — {spool.material}
                                 </div>
                                 <div className="text-[11px] text-zinc-400">
-                                  {spool.colorName} ({spool.densityGcm3} g/cm³)
+                                  Colore: {spool.colorName} (€ {spool.costPerKg}/Kg)
                                 </div>
                               </div>
                             </div>
                           </td>
 
                           <td className="py-3.5 px-4 font-mono-tech">
-                            {usedByPrinter ? (
-                              <span
-                                className={`px-2 py-1 rounded text-[11px] inline-flex items-center gap-1.5 ${
-                                  isDepleting
-                                    ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-                                    : 'bg-zinc-800 text-zinc-300'
-                                }`}
-                              >
-                                {isDepleting && (
-                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
-                                )}
-                                {usedByPrinter.code} ({usedByPrinter.model})
+                            {mountedOn ? (
+                              <span className="px-2 py-1 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 text-[11px]">
+                                {mountedOn.model}
                               </span>
                             ) : (
-                              <span className="text-zinc-500">In Scaffale</span>
+                              <span className="text-zinc-500">In Magazzino</span>
                             )}
                           </td>
 
-                          <td className="py-3.5 px-4 min-w-[220px]">
+                          <td className="py-3.5 px-4 min-w-[240px]">
                             <div className="flex items-center justify-between font-mono-tech mb-1">
-                              <span
-                                className={`text-sm font-bold ${
-                                  spool.remainingWeightG <= spool.reorderThresholdG
-                                    ? 'text-red-400'
-                                    : 'text-amber-400'
-                                }`}
-                              >
-                                {spool.remainingWeightG.toFixed(2)} g
-                              </span>
-                              <span className="text-[11px] text-zinc-400">
-                                {pct.toFixed(1)}%
-                              </span>
+                              <div className="flex items-center gap-1.5">
+                                <input
+                                  type="number"
+                                  value={Math.round(spool.remainingWeightG)}
+                                  onChange={(e) =>
+                                    updateSpoolWeight(spool.id, parseFloat(e.target.value) || 0)
+                                  }
+                                  className="w-20 bg-[#09090b] border border-zinc-700 rounded px-2 py-0.5 text-sm font-bold text-amber-400 outline-none"
+                                />
+                                <span className="text-zinc-400">
+                                  g / {spool.initialWeightG}g
+                                </span>
+                              </div>
+                              <span className="text-[11px] text-zinc-400">{pct.toFixed(0)}%</span>
                             </div>
                             <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden">
                               <div
-                                className={`h-full transition-all duration-300 ${
+                                className={`h-full ${
                                   spool.remainingWeightG <= spool.reorderThresholdG
                                     ? 'bg-red-500'
-                                    : 'bg-blue-500'
+                                    : 'bg-emerald-500'
                                 }`}
                                 style={{ width: `${pct}%` }}
                               />
                             </div>
                           </td>
 
-                          <td className="py-3.5 px-4 font-mono-tech text-zinc-200">
-                            € {residualEur.toFixed(2)}
-                          </td>
-
-                          <td className="py-3.5 px-4 text-right">
+                          <td className="py-3.5 px-4 text-right space-x-2">
                             <button
                               onClick={() => refillSpool(spool.id)}
-                              className="px-2.5 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-mono-tech text-[11px] inline-flex items-center gap-1.5 transition-colors cursor-pointer"
-                              title="Carica nuova bobina da 1000g"
+                              className="px-2.5 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-mono-tech text-[11px] inline-flex items-center gap-1 cursor-pointer"
                             >
                               <RotateCcw size={12} />
-                              <span>Ricarica 1Kg</span>
+                              <span>1Kg</span>
+                            </button>
+                            <button
+                              onClick={() => deleteSpool(spool.id)}
+                              className="p-1.5 rounded bg-zinc-800 hover:bg-red-900/40 text-zinc-400 hover:text-red-400 inline-flex items-center cursor-pointer"
+                              title="Elimina bobina"
+                            >
+                              <Trash2 size={14} />
                             </button>
                           </td>
                         </tr>
@@ -670,304 +731,182 @@ export default function EnterpriseMesDashboard() {
           )}
 
           {/* ===============================================================
-              MODULO 3: CENTRALE ENERGETICA & COSTI CORRENTE REAL-TIME
+              MODULO 3: CORRENTE E COSTI ELETTRICI
           =============================================================== */}
           {activeModule === 'energy' && (
             <div className="space-y-5">
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 pb-4">
                 <div>
                   <h2 className="text-lg font-semibold text-white">
-                    Telemetria Assorbimento Elettrico & Costi Industriali
+                    Contabilizzazione Corrente Elettrica in Tempo Reale
                   </h2>
                   <p className="text-xs text-zinc-400">
-                    Calcolo istantaneo del carico in Watt su tutte le 4 linee e proiezione costi energetici.
+                    Puoi calibrare i Watt assorbiti da ogni stampante cliccando &quot;Configura&quot; sulla macchina, o collegare l&apos;IP di una presa Shelly.
                   </p>
                 </div>
 
                 <div className="flex items-center gap-2 bg-[#121215] border border-zinc-800 px-3 py-1.5 rounded">
-                  <span className="text-xs text-zinc-400">Tariffa (€/kWh):</span>
+                  <span className="text-xs text-zinc-400">Costo Energia (€/kWh):</span>
                   <input
                     type="number"
                     step="0.01"
                     value={electricityCostPerKwh}
-                    onChange={(e) =>
-                      setElectricityRate(parseFloat(e.target.value) || 0)
-                    }
+                    onChange={(e) => setElectricityRate(parseFloat(e.target.value) || 0)}
                     className="w-20 bg-[#09090b] border border-zinc-700 rounded px-2 py-1 text-xs font-mono-tech text-emerald-400 outline-none"
                   />
                 </div>
               </div>
 
-              {/* Card Riepilogo Energetico */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div className="bg-[#121215] border border-zinc-800 p-4 rounded-lg">
                   <div className="text-xs text-zinc-400 uppercase font-mono-tech">
-                    Potenza Istantanea Flotta
+                    Assorbimento Attuale
                   </div>
                   <div className="text-2xl font-mono-tech font-bold text-amber-400 mt-1">
-                    {totalLiveWatts} W
+                    {totalLiveWatts} Watt
                   </div>
                   <div className="text-[11px] text-zinc-500 mt-1">
-                     Capacità massima installata: 1.900 W
+                    Somma di {activePrintersCount} macchine in stampa + standby
                   </div>
                 </div>
 
                 <div className="bg-[#121215] border border-zinc-800 p-4 rounded-lg">
                   <div className="text-xs text-zinc-400 uppercase font-mono-tech">
-                    Costo Orario Attuale
+                    Spesa Elettrica Oraria
                   </div>
                   <div className="text-2xl font-mono-tech font-bold text-emerald-400 mt-1">
                     € {hourlyCostEur.toFixed(3)} / ora
                   </div>
                   <div className="text-[11px] text-zinc-500 mt-1">
-                    Proiezione 24h continuo: € {(hourlyCostEur * 24).toFixed(2)}
+                    Giornata continua (24h): € {(hourlyCostEur * 24).toFixed(2)}
                   </div>
                 </div>
 
                 <div className="bg-[#121215] border border-zinc-800 p-4 rounded-lg">
                   <div className="text-xs text-zinc-400 uppercase font-mono-tech">
-                    Energia Totale Contabilizzata
+                    Totale Consumato Storico
                   </div>
                   <div className="text-2xl font-mono-tech font-bold text-white mt-1">
-                    {printers
-                      .reduce((acc, p) => acc + p.totalKwhConsumed, 0)
-                      .toFixed(2)}{' '}
-                    kWh
+                    {printers.reduce((a, b) => a + b.totalKwhConsumed, 0).toFixed(2)} kWh
                   </div>
                   <div className="text-[11px] text-zinc-500 mt-1">
-                    Costo storico flotta: €{' '}
+                    Costo totale maturato: €{' '}
                     {(
-                      printers.reduce((acc, p) => acc + p.totalKwhConsumed, 0) *
+                      printers.reduce((a, b) => a + b.totalKwhConsumed, 0) *
                       electricityCostPerKwh
                     ).toFixed(2)}
                   </div>
                 </div>
               </div>
 
-              {/* Ripartizione Carico Elettrico per Singola Macchina */}
-              <div className="bg-[#121215] border border-zinc-800 rounded-lg p-4 space-y-4">
+              <div className="bg-[#121215] border border-zinc-800 rounded-lg p-4 space-y-3">
                 <h3 className="text-sm font-semibold text-white">
-                  Assorbimento Specifico per Unità Operativa
+                  Dettaglio Consumo per Stampante (Configurabile)
                 </h3>
-
-                <div className="space-y-3">
-                  {printers.map((p) => {
-                    const loadPct = Math.min(
-                      100,
-                      (p.currentWatts / p.ratedMaxWatts) * 100
-                    );
-                    const unitCostPerHour =
-                      (p.currentWatts / 1000) * electricityCostPerKwh;
-
-                    return (
-                      <div
-                        key={p.id}
-                        className="bg-[#09090b] border border-zinc-800 p-3.5 rounded space-y-2"
+                {printers.map((p) => (
+                  <div
+                    key={p.id}
+                    className="bg-[#09090b] border border-zinc-800 p-3.5 rounded flex flex-wrap items-center justify-between gap-3 text-xs"
+                  >
+                    <div>
+                      <span className="font-mono-tech font-bold text-white">{p.model}</span>
+                      <span className="text-zinc-500 ml-2">
+                        (Tarata a {p.printingWattsConfig}W in stampa / {p.idleWattsConfig}W standby)
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-4 font-mono-tech">
+                      <span className="text-amber-400 font-bold">{p.currentWatts} W attuali</span>
+                      <span className="text-emerald-400">
+                        {p.totalKwhConsumed.toFixed(3)} kWh accumulati
+                      </span>
+                      <button
+                        onClick={() => openEditPrinter(p)}
+                        className="px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded cursor-pointer"
                       >
-                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono-tech font-semibold text-white">
-                              {p.code}
-                            </span>
-                            <span className="text-zinc-400">
-                              ({p.brand} {p.model})
-                            </span>
-                          </div>
-                          <div className="flex items-center gap-4 font-mono-tech">
-                            <span className="text-amber-400 font-semibold">
-                              {p.currentWatts} W / {p.ratedMaxWatts} W max
-                            </span>
-                            <span className="text-emerald-400">
-                              € {unitCostPerHour.toFixed(3)}/h
-                            </span>
-                            <span className="text-zinc-400">
-                              Tot: {p.totalKwhConsumed.toFixed(2)} kWh
-                            </span>
-                          </div>
-                        </div>
-
-                        <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden">
-                          <div
-                            className="h-full bg-amber-500 transition-all duration-300"
-                            style={{ width: `${loadPct}%` }}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                        Calibra Watt
+                      </button>
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
           )}
 
           {/* ===============================================================
-              MODULO 4: MANUTENZIONE PREDITTIVA & ORDINI DI ACQUISTO
+              MODULO 4: MANUTENZIONE & ORDINI DI ACQUISTO
           =============================================================== */}
           {activeModule === 'maintenance' && (
             <div className="space-y-6">
-              <div>
-                <h2 className="text-lg font-semibold text-white">
-                  Registro Manutenzione Programmata (MTBF) & Ordini
-                </h2>
-                <p className="text-xs text-zinc-400">
-                  Le ore di esercizio di ugelli, cinghie e viti Z avanzano in automatico durante la stampa.
-                </p>
-              </div>
-
-              {/* Griglia Manutenzione per le 4 Stampanti */}
-              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-                {printers.map((printer) => (
-                  <div
-                    key={printer.id}
-                    className="bg-[#121215] border border-zinc-800 rounded-lg p-4 space-y-3"
-                  >
-                    <div className="flex items-center justify-between border-b border-zinc-800 pb-2.5">
-                      <div>
-                        <span className="font-mono-tech text-xs text-blue-400 font-semibold">
-                          {printer.code}
-                        </span>
-                        <h3 className="text-sm font-semibold text-white">
-                          {printer.brand} {printer.model}
-                        </h3>
-                      </div>
-                      <div className="text-right font-mono-tech">
-                        <span className="text-[10px] uppercase text-zinc-400 block">
-                          Monte Ore Totale
-                        </span>
-                        <span className="text-sm font-bold text-white">
-                          {printer.totalPrintHours.toFixed(1)} h
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="space-y-2.5">
-                      {printer.components.map((comp) => {
-                        const wearPct = Math.min(
-                          100,
-                          (comp.currentHours / comp.maxHours) * 100
-                        );
-                        const isWarning = wearPct >= 85;
-
-                        return (
-                          <div
-                            key={comp.id}
-                            className="bg-[#09090b] border border-zinc-800/90 p-2.5 rounded space-y-1.5"
-                          >
-                            <div className="flex items-center justify-between text-xs">
-                              <span className="font-medium text-zinc-200 flex items-center gap-1.5">
-                                {isWarning && (
-                                  <AlertTriangle
-                                    size={13}
-                                    className="text-amber-400 shrink-0"
-                                  />
-                                )}
-                                {comp.name}
-                              </span>
-                              <div className="flex items-center gap-2">
-                                <span
-                                  className={`font-mono-tech text-xs ${
-                                    isWarning ? 'text-amber-400 font-bold' : 'text-zinc-400'
-                                  }`}
-                                >
-                                  {comp.currentHours.toFixed(1)} / {comp.maxHours} h
-                                </span>
-                                <button
-                                  onClick={() =>
-                                    resetComponentWear(printer.id, comp.id)
-                                  }
-                                  className="px-2 py-0.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded text-[10px] font-mono-tech transition-colors cursor-pointer"
-                                  title="Segna manutenzione effettuata e azzera ore"
-                                >
-                                  Reset Tagliando
-                                </button>
-                              </div>
-                            </div>
-
-                            <div className="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden">
-                              <div
-                                className={`h-full ${
-                                  wearPct >= 90
-                                    ? 'bg-red-500'
-                                    : wearPct >= 75
-                                    ? 'bg-amber-500'
-                                    : 'bg-emerald-500'
-                                }`}
-                                style={{ width: `${wearPct}%` }}
-                              />
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {/* CODA ORDINI DI APPROVVIGIONAMENTO */}
+              {/* Form aggiunta ordine manuale */}
               <div className="bg-[#121215] border border-zinc-800 rounded-lg p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-                    <ShoppingCart size={16} className="text-amber-400" />
-                    <span>Coda Ordini di Acquisto (Filamenti & Ricambi)</span>
-                  </h3>
-                  <span className="text-xs font-mono-tech text-zinc-400">
-                    Generati automaticamente da soglie stock e usura
-                  </span>
+                <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                  <ShoppingCart size={16} className="text-amber-400" />
+                  <span>Aggiungi Ordine / Ricambio alla Lista Acquisti</span>
+                </h3>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="text"
+                    placeholder="Es. 2x Bobine PLA Nero Anycubic + Ugelli 0.4mm..."
+                    value={newOrderDesc}
+                    onChange={(e) => setNewOrderDesc(e.target.value)}
+                    className="flex-grow bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-xs text-white outline-none"
+                  />
+                  <input
+                    type="number"
+                    placeholder="Costo €"
+                    value={newOrderCost}
+                    onChange={(e) => setNewOrderCost(parseFloat(e.target.value) || 0)}
+                    className="w-24 bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-xs font-mono-tech text-emerald-400 outline-none"
+                  />
+                  <button
+                    onClick={() => {
+                      if (!newOrderDesc.trim()) return;
+                      addManualOrder(newOrderDesc.trim(), 'FILAMENT', newOrderCost, 'HIGH');
+                      setNewOrderDesc('');
+                    }}
+                    className="bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium px-4 py-2 rounded cursor-pointer"
+                  >
+                    + Inserisci in Coda Ordini
+                  </button>
                 </div>
 
-                <div className="divide-y divide-zinc-800">
+                {/* Lista Ordini */}
+                <div className="divide-y divide-zinc-800 pt-2">
                   {orders.length === 0 ? (
-                    <div className="py-6 text-center text-xs text-zinc-500 font-mono-tech">
-                      Nessun ordine pendente. Scorte e componenti entro i parametri nominali.
+                    <div className="py-4 text-xs text-zinc-500 font-mono-tech">
+                      Nessun ordine in coda.
                     </div>
                   ) : (
                     orders.map((ord) => (
                       <div
                         key={ord.id}
-                        className="py-3 flex flex-wrap items-center justify-between gap-3 text-xs"
+                        className="py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs"
                       >
-                        <div className="flex items-center gap-3">
-                          <span
-                            className={`px-2 py-0.5 rounded font-mono-tech text-[10px] font-semibold ${
-                              ord.priority === 'CRITICAL'
-                                ? 'bg-red-500/15 text-red-400 border border-red-500/30'
-                                : 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
-                            }`}
-                          >
-                            {ord.priority}
+                        <div>
+                          <span className="font-semibold text-white">{ord.description}</span>
+                          <span className="text-zinc-500 font-mono-tech ml-2">
+                            ({ord.createdAt})
                           </span>
-                          <div>
-                            <div className="font-semibold text-zinc-100">
-                              {ord.description}
-                            </div>
-                            <div className="font-mono-tech text-[11px] text-zinc-500">
-                              Codice: {ord.itemCode} • Rilevato: {ord.createdAt}
-                            </div>
-                          </div>
                         </div>
-
-                        <div className="flex items-center gap-3">
-                          <span className="font-mono-tech font-semibold text-zinc-200">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono-tech text-emerald-400 font-bold">
                             € {ord.estimatedCost.toFixed(2)}
                           </span>
-
                           {ord.status === 'PENDING' ? (
                             <button
                               onClick={() => markOrderAsOrdered(ord.id)}
-                              className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded font-medium transition-colors cursor-pointer"
+                              className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded cursor-pointer"
                             >
                               Segna Ordinato
                             </button>
                           ) : (
-                            <span className="px-2.5 py-1 bg-zinc-800 text-emerald-400 rounded font-mono-tech text-[11px] flex items-center gap-1">
-                              <CheckCircle2 size={12} /> IN ARRIVO
+                            <span className="px-2 py-1 bg-zinc-800 text-emerald-400 rounded font-mono-tech text-[10px]">
+                              ORDINATO ✓
                             </span>
                           )}
-
                           <button
                             onClick={() => deleteOrder(ord.id)}
-                            className="p-1.5 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer"
-                            title="Rimuovi voce"
+                            className="p-1 text-zinc-500 hover:text-red-400 cursor-pointer"
                           >
                             <Trash2 size={14} />
                           </button>
@@ -977,17 +916,405 @@ export default function EnterpriseMesDashboard() {
                   )}
                 </div>
               </div>
+
+              {/* Stato Usura Componenti per ciascuna Stampante */}
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                {printers.map((printer) => (
+                  <div
+                    key={printer.id}
+                    className="bg-[#121215] border border-zinc-800 rounded-lg p-4 space-y-3"
+                  >
+                    <div className="flex items-center justify-between border-b border-zinc-800 pb-2">
+                      <h3 className="text-sm font-semibold text-white">
+                        {printer.brand} — {printer.model}
+                      </h3>
+                      <span className="font-mono-tech text-xs text-zinc-400">
+                        Ore Totali: {printer.totalPrintHours.toFixed(1)}h
+                      </span>
+                    </div>
+
+                    <div className="space-y-2">
+                      {printer.components.map((comp) => {
+                        const pct = Math.min(100, (comp.currentHours / comp.maxHours) * 100);
+                        return (
+                          <div
+                            key={comp.id}
+                            className="bg-[#09090b] border border-zinc-800 p-2.5 rounded space-y-1.5"
+                          >
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="text-zinc-200">{comp.name}</span>
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono-tech text-zinc-400">
+                                  {comp.currentHours.toFixed(1)} / {comp.maxHours}h
+                                </span>
+                                <button
+                                  onClick={() => resetComponentWear(printer.id, comp.id)}
+                                  className="px-2 py-0.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded text-[10px] font-mono-tech cursor-pointer"
+                                >
+                                  Reset Tagliando
+                                </button>
+                              </div>
+                            </div>
+                            <div className="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+                              <div
+                                className={`h-full ${
+                                  pct > 85 ? 'bg-red-500' : 'bg-emerald-500'
+                                }`}
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </main>
       </div>
 
       {/* =====================================================================
-          BOTTOM NAVIGATION BAR PER IPHONE / MOBILE (< lg)
+          MODAL 1: AGGIUNGI NUOVA BOBINA DI FILAMENTO
       ===================================================================== */}
+      {isSpoolModalOpen && (
+        <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
+          <div className="bg-[#121215] border border-zinc-700 rounded-xl w-full max-w-md p-5 space-y-4">
+            <div className="flex items-center justify-between border-b border-zinc-800 pb-3">
+              <h3 className="text-sm font-semibold text-white">
+                Carica Nuova Bobina in Magazzino
+              </h3>
+              <button
+                onClick={() => setIsSpoolModalOpen(false)}
+                className="text-zinc-400 hover:text-white"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveSpool} className="space-y-3 text-xs">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-zinc-400 block mb-1">Marca</label>
+                  <input
+                    type="text"
+                    required
+                    value={spoolForm.brand}
+                    onChange={(e) => setSpoolForm({ ...spoolForm, brand: e.target.value })}
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white"
+                  />
+                </div>
+                <div>
+                  <label className="text-zinc-400 block mb-1">Materiale</label>
+                  <select
+                    value={spoolForm.material}
+                    onChange={(e) =>
+                      setSpoolForm({
+                        ...spoolForm,
+                        material: e.target.value as 'PLA' | 'PETG' | 'ASA' | 'ABS' | 'TPU',
+                      })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white"
+                  >
+                    <option value="PLA">PLA</option>
+                    <option value="PETG">PETG</option>
+                    <option value="ASA">ASA</option>
+                    <option value="ABS">ABS</option>
+                    <option value="TPU">TPU</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-zinc-400 block mb-1">Nome Colore</label>
+                  <input
+                    type="text"
+                    required
+                    value={spoolForm.colorName}
+                    onChange={(e) =>
+                      setSpoolForm({ ...spoolForm, colorName: e.target.value })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white"
+                  />
+                </div>
+                <div>
+                  <label className="text-zinc-400 block mb-1">Colore Visivo</label>
+                  <input
+                    type="color"
+                    value={spoolForm.colorHex}
+                    onChange={(e) =>
+                      setSpoolForm({ ...spoolForm, colorHex: e.target.value })
+                    }
+                    className="w-full h-9 bg-[#09090b] border border-zinc-700 rounded px-1 py-1 cursor-pointer"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <label className="text-zinc-400 block mb-1">Peso Iniziale (g)</label>
+                  <input
+                    type="number"
+                    required
+                    value={spoolForm.initialWeightG}
+                    onChange={(e) =>
+                      setSpoolForm({
+                        ...spoolForm,
+                        initialWeightG: Number(e.target.value),
+                        remainingWeightG: Number(e.target.value),
+                      })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white font-mono-tech"
+                  />
+                </div>
+                <div>
+                  <label className="text-zinc-400 block mb-1">Prezzo (€/Kg)</label>
+                  <input
+                    type="number"
+                    step="0.5"
+                    required
+                    value={spoolForm.costPerKg}
+                    onChange={(e) =>
+                      setSpoolForm({ ...spoolForm, costPerKg: Number(e.target.value) })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white font-mono-tech"
+                  />
+                </div>
+                <div>
+                  <label className="text-zinc-400 block mb-1">Soglia Ordine (g)</label>
+                  <input
+                    type="number"
+                    required
+                    value={spoolForm.reorderThresholdG}
+                    onChange={(e) =>
+                      setSpoolForm({
+                        ...spoolForm,
+                        reorderThresholdG: Number(e.target.value),
+                      })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white font-mono-tech"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-zinc-400 block mb-1">Codice SKU</label>
+                  <input
+                    type="text"
+                    value={spoolForm.sku}
+                    onChange={(e) => setSpoolForm({ ...spoolForm, sku: e.target.value })}
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white font-mono-tech"
+                  />
+                </div>
+                <div>
+                  <label className="text-zinc-400 block mb-1">Codice NFC / Barcode</label>
+                  <input
+                    type="text"
+                    value={spoolForm.nfcUid}
+                    onChange={(e) => setSpoolForm({ ...spoolForm, nfcUid: e.target.value })}
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white font-mono-tech"
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-zinc-800">
+                <button
+                  type="button"
+                  onClick={() => setIsSpoolModalOpen(false)}
+                  className="px-4 py-2 rounded bg-zinc-800 text-zinc-300"
+                >
+                  Annulla
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-semibold cursor-pointer"
+                >
+                  Salva Bobina
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* =====================================================================
+          MODAL 2: CONFIGURA STAMPANTE (IP, MODELLO, WATT CORRENTE, VELOCITÀ)
+      ===================================================================== */}
+      {isPrinterModalOpen && (
+        <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
+          <div className="bg-[#121215] border border-zinc-700 rounded-xl w-full max-w-lg p-5 space-y-4 max-h-[90dvh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-zinc-800 pb-3">
+              <h3 className="text-sm font-semibold text-white">
+                {editingPrinterId ? 'Configura Parametri Stampante' : 'Aggiungi Stampante'}
+              </h3>
+              <button
+                onClick={() => setIsPrinterModalOpen(false)}
+                className="text-zinc-400 hover:text-white"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSavePrinter} className="space-y-3 text-xs">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-zinc-400 block mb-1">Marca</label>
+                  <select
+                    value={printerForm.brand}
+                    onChange={(e) =>
+                      setPrinterForm({ ...printerForm, brand: e.target.value as PrinterBrand })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white"
+                  >
+                    <option value="Anycubic">Anycubic</option>
+                    <option value="Creality">Creality</option>
+                    <option value="Altro">Altro</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-zinc-400 block mb-1">Nome / Modello Esatto</label>
+                  <input
+                    type="text"
+                    required
+                    value={printerForm.model}
+                    onChange={(e) =>
+                      setPrinterForm({ ...printerForm, model: e.target.value })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-3">
+                <div className="col-span-2">
+                  <label className="text-zinc-400 block mb-1">Indirizzo IP Locale</label>
+                  <input
+                    type="text"
+                    value={printerForm.ipAddress}
+                    onChange={(e) =>
+                      setPrinterForm({ ...printerForm, ipAddress: e.target.value })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white font-mono-tech"
+                  />
+                </div>
+                <div>
+                  <label className="text-zinc-400 block mb-1">Porta API</label>
+                  <input
+                    type="number"
+                    value={printerForm.port}
+                    onChange={(e) =>
+                      setPrinterForm({ ...printerForm, port: Number(e.target.value) })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white font-mono-tech"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <label className="text-zinc-400 block mb-1">Watt in Stampa</label>
+                  <input
+                    type="number"
+                    value={printerForm.printingWattsConfig}
+                    onChange={(e) =>
+                      setPrinterForm({
+                        ...printerForm,
+                        printingWattsConfig: Number(e.target.value),
+                      })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-amber-400 font-mono-tech font-bold"
+                  />
+                </div>
+                <div>
+                  <label className="text-zinc-400 block mb-1">Watt in Standby</label>
+                  <input
+                    type="number"
+                    value={printerForm.idleWattsConfig}
+                    onChange={(e) =>
+                      setPrinterForm({
+                        ...printerForm,
+                        idleWattsConfig: Number(e.target.value),
+                      })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white font-mono-tech"
+                  />
+                </div>
+                <div>
+                  <label className="text-zinc-400 block mb-1">Flusso (mm³/s)</label>
+                  <input
+                    type="number"
+                    step="0.5"
+                    value={printerForm.flowRateMm3s}
+                    onChange={(e) =>
+                      setPrinterForm({
+                        ...printerForm,
+                        flowRateMm3s: Number(e.target.value),
+                      })
+                    }
+                    className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-emerald-400 font-mono-tech"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-zinc-400 block mb-1">
+                  IP Presa Smart Shelly (Opzionale per lettura Watt via Wi-Fi)
+                </label>
+                <input
+                  type="text"
+                  placeholder="Es. 192.168.1.150 (lascia vuoto per calcolo automatico)"
+                  value={printerForm.smartPlugIp}
+                  onChange={(e) =>
+                    setPrinterForm({ ...printerForm, smartPlugIp: e.target.value })
+                  }
+                  className="w-full bg-[#09090b] border border-zinc-700 rounded px-3 py-2 text-white font-mono-tech"
+                />
+              </div>
+
+              <div className="flex items-center justify-between pt-3 border-t border-zinc-800">
+                {editingPrinterId ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      deletePrinter(editingPrinterId);
+                      setIsPrinterModalOpen(false);
+                    }}
+                    className="px-3 py-2 rounded bg-red-950/60 text-red-400 hover:bg-red-900/60 cursor-pointer"
+                  >
+                    Elimina Macchina
+                  </button>
+                ) : (
+                  <div />
+                )}
+
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsPrinterModalOpen(false)}
+                    className="px-4 py-2 rounded bg-zinc-800 text-zinc-300"
+                  >
+                    Annulla
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-4 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white font-semibold cursor-pointer"
+                  >
+                    Salva Configurazione
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* BARRA INFERIORE PER IPHONE / MOBILE */}
       <nav className="lg:hidden bg-[#121215] border-t border-zinc-800 grid grid-cols-4 py-1.5 px-2 shrink-0 z-30">
         {[
-          { id: 'fleet', label: 'Macchine', icon: Server },
+          { id: 'fleet', label: 'Stampanti', icon: Server },
           { id: 'inventory', label: 'Filamenti', icon: Layers },
           { id: 'energy', label: 'Corrente', icon: Zap },
           { id: 'maintenance', label: 'Manutenz.', icon: Wrench },
@@ -998,7 +1325,7 @@ export default function EnterpriseMesDashboard() {
             <button
               key={tab.id}
               onClick={() => setActiveModule(tab.id as ActiveModule)}
-              className={`flex flex-col items-center justify-center py-1.5 rounded transition-colors ${
+              className={`flex flex-col items-center justify-center py-1.5 rounded ${
                 isActive ? 'text-blue-400 font-semibold' : 'text-zinc-400'
               }`}
             >
